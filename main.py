@@ -10,7 +10,6 @@ TG_API_HASH = os.getenv("TG_API_HASH")
 TG_SESSION = os.getenv("TG_SESSION")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# النموذج المستقر
 GROQ_MODEL = "openai/gpt-oss-120b"
 STATE_FILE = "relay_state.json"
 DOWNLOAD_DIR = "downloads"
@@ -22,8 +21,11 @@ CHANNELS = {
         "source_username": "@eduiq23",
         "add_link": True, "link": "https://t.me/TalibLib",
         "prompt": """أنت محرر لقناة تعليمية (مكتبة الطالب). 
-- انشر فقط الأخبار التي تخص الطلبة، الجامعات، وزارة التربية، أو المنح الدراسية (اجعل should_post=true).
-- إذا كان إعلاناً تجارياً أو خبراً عاماً لا يخص الطلبة، اجعل should_post=false.
+- انشر فقط الأخبار الرسمية أو المعلومات المجانية المفيدة التي تخص الطلبة، الجامعات، وزارة التربية، أو المنح الدراسية (اجعل should_post=true).
+- **ممنوع النشر (اجعل should_post=false) إذا كان المنشور يحتوي على:**
+  1. بيع أو ترويج لملخصات، كتب، أو دورات (حتى لو كانت تعليمية).
+  2. طلب من الطالب مراسلة معرف معين للتواصل أو الحجز (مثل: راسل المعرف، تواصل معنا، @IQED3).
+  3. أي أسعار، خصومات، أو إعلانات تجارية.
 - أعد صياغة النص بشكل واضح ومختصر.
 - لا تذكر اسم قناة المصدر أو روابطها نهائياً."""
     },
@@ -44,8 +46,6 @@ def save_state(state):
 state = load_state()
 DUP_HISTORY_SIZE = 30
 DUP_SIMILARITY_THRESHOLD = 0.80   
-DUP_OVERLAP_THRESHOLD = 0.85      
-DUP_MIN_TOKENS = 6                
 
 def _norm_for_dup(text):
     t = text.lower()
@@ -55,21 +55,14 @@ def _norm_for_dup(text):
     t = re.sub(r'[^\w\u0600-\u06FF\s]', ' ', t)
     return re.sub(r'\s+', ' ', t).strip()
 
-def _dup_tokens(norm): return set(re.findall(r'[\w\u0600-\u06FF]{3,}', norm))
-
 def is_duplicate_content(source_id, text):
     if not text or not text.strip(): return False
     norm = _norm_for_dup(text)
     if not norm: return False
-    new_tokens = _dup_tokens(norm)
     recent = state.setdefault("recent_texts", {}).get(str(source_id), [])
     for prev in recent:
         prev_norm = _norm_for_dup(prev)
         if difflib.SequenceMatcher(None, norm, prev_norm).ratio() >= DUP_SIMILARITY_THRESHOLD: return True
-        prev_tokens = _dup_tokens(prev_norm)
-        smaller = min(len(new_tokens), len(prev_tokens))
-        if smaller >= DUP_MIN_TOKENS and len(new_tokens) <= len(prev_tokens) * 1.25:
-            if len(new_tokens & prev_tokens) / smaller >= DUP_OVERLAP_THRESHOLD: return True
     return False
 
 def record_published_text(source_id, text):
@@ -85,25 +78,25 @@ def commit_state():
     save_state(state)
     try:
         subprocess.run(["git", "add", STATE_FILE], check=False)
-        c = subprocess.run(["git", "commit", "-m", "update relay state"], capture_output=True, text=True)
+        c = subprocess.run(["git", "commit", "-m", "update state"], capture_output=True, text=True)
         if c.returncode != 0 and "nothing to commit" in (c.stdout + c.stderr).lower(): return
         for attempt in range(1, 4):
             subprocess.run(["git", "pull", "--rebase", "origin", "main"], capture_output=True, text=True)
             p = subprocess.run(["git", "push"], capture_output=True, text=True)
             if p.returncode == 0: return
             time.sleep(2 * attempt)
-    except Exception as e: print(f"⚠️ git error: {e}")
+    except Exception as e: pass
 
-def _is_small_thumbnail_photo(photo, abs_threshold=250, square_size_cap=800):
+def _is_small_thumbnail_photo(photo):
     try:
         dims = [(getattr(s, "w", 0), getattr(s, "h", 0)) for s in photo.sizes if hasattr(s, "w")]
         if not dims: return False
         max_w = max(w for w, _ in dims)
         max_h = max(h for _, h in dims)
-        if max_w < abs_threshold and max_h < abs_threshold: return True
+        if max_w < 250 and max_h < 250: return True
         if max_w > 0 and max_h > 0:
             ratio = max_w / max_h
-            if 0.85 <= ratio <= 1.18 and max(max_w, max_h) <= square_size_cap: return True
+            if 0.85 <= ratio <= 1.18 and max(max_w, max_h) <= 800: return True
         return False
     except Exception: return False
 
@@ -141,13 +134,8 @@ def clean_text(text, source_username=None):
     cleaned = re.sub(r'(https?://)?t\.me/\S+', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'https?://t\.co/\S+', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'(?i)forwarded from.*', '', cleaned)
-    cleaned = re.sub(r'(?i)read\s*more\.?\s*$', '', cleaned.rstrip())
-    cleaned = re.sub(r'اقرأ\s*المزيد\.?\s*$', '', cleaned.rstrip())
-    cleaned = re.sub(r'أعيد التوجيه من.*', '', cleaned)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
-    lines = cleaned.split('\n')
-    while lines and not re.search(r'[A-Za-z\u0600-\u06FF0-9]', lines[-1]): lines.pop()
-    return '\n'.join(lines).rstrip()
+    return cleaned
 
 SHARE_PHRASE_RE = re.compile(r'شارك\s+(القناة|المنشور)\s+مع\s+[اأ]?صدقائ?ك?', re.IGNORECASE)
 def insert_link_after_share_phrase(text, link_text):
@@ -158,6 +146,18 @@ def insert_link_after_share_phrase(text, link_text):
     return text[:newline_idx] + f"\n{link_text}" + text[newline_idx:]
 
 def contains_click_here_phrase(text): return bool(re.search(r'اضغط\s*هنا.{0,15}(للمشاهدة|لمشاهدة|مشاهدة)', text)) if text else False
+
+# === فلتر برمجي صارم للإعلانات ===
+def is_hardcoded_ad(text):
+    if not text: return False
+    ad_keywords = [
+        r"راسل\s+المعرف", r"@IQED3", r"للحجز", r"للطلب", 
+        r"سعر", r"دينار", r"خصم", r"اشتراك", r"ملخصات\s+ذهبية"
+    ]
+    for kw in ad_keywords:
+        if re.search(kw, text, re.IGNORECASE):
+            return True
+    return False
 
 def call_groq(prompt, max_retries=3):
     if not GROQ_API_KEY: raise RuntimeError("no groq key")
@@ -179,6 +179,7 @@ async def apply_processing(config, text):
     if not text: return {"should_post": True, "text": ""}
     custom_prompt = config.get("prompt", "")
     if not custom_prompt: return {"should_post": True, "text": text}
+    
     full_prompt = f"""{custom_prompt}
 
 النص المراد معالجته:
@@ -199,21 +200,39 @@ async def apply_processing(config, text):
 async def process_batch(source_id, messages):
     config = CHANNELS.get(source_id)
     if not config: return
+    
     raw_text = next((m.message for m in messages if m.message), "")
     text_msg = next((m for m in messages if m.message), None)
+    
     if contains_click_here_phrase(raw_text): return
+    
+    # التحقق من الفلتر البرمجي للإعلانات
+    if is_hardcoded_ad(raw_text):
+        print(f"⏭️ تجاهل إعلان تجاري (فلتر برمجي) — {config['name']}")
+        return
+    
     hidden_links = extract_hidden_link_urls(text_msg, config.get("source_username"))
-    if hidden_links: raw_text = (raw_text.rstrip() + "\n\n" + "\n".join(hidden_links)) if raw_text else "\n".join(hidden_links)
+    if hidden_links: 
+        raw_text = (raw_text.rstrip() + "\n\n" + "\n".join(hidden_links)) if raw_text else "\n".join(hidden_links)
+    
     cleaned = clean_text(raw_text, config.get("source_username"))
+    
     if is_duplicate_content(source_id, cleaned): return
+    
     res = await apply_processing(config, cleaned)
     should_post = res.get("should_post", True)
     final_text = res.get("text", cleaned)
-    if not should_post and cleaned: return 
+    
+    if not should_post and cleaned: 
+        print(f"⏭️ تجاهل إعلان (ذكاء اصطناعي) — {config['name']}")
+        return 
+    
     if cleaned: record_published_text(source_id, cleaned)
     if final_text and is_duplicate_content(f"{source_id}#final", final_text): return
     if final_text: record_published_text(f"{source_id}#final", final_text)
+    
     media_msgs = [m for m in messages if _is_usable_media_msg(m)]
+
     if config.get("add_link") and config.get("link"):
         link_text = config["link"]
         inserted = None
@@ -221,6 +240,7 @@ async def process_batch(source_id, messages):
             inserted = insert_link_after_share_phrase(final_text, link_text)
         if inserted is not None: final_text = inserted
         else: final_text = f"{final_text}\n\n{link_text}" if final_text else link_text
+
     try:
         if media_msgs:
             try:
@@ -245,6 +265,7 @@ async def process_batch(source_id, messages):
                         print(f"✅ نُشر (وسائط محمية) — {config['name']}")
                         return
                 else: raise e
+                
         if final_text:
             await client.send_message(config["target"], final_text, parse_mode="html", link_preview=False)
             print(f"✅ نُشر (نص) — {config['name']}")
@@ -255,14 +276,17 @@ async def catch_up_channel(source_id):
     entity_ref = config.get("source_username") or source_id
     key = str(source_id)
     last_id = state.get(key, 0)
+    
     if last_id == 0:
         latest = await client.get_messages(entity_ref, limit=1)
         if latest: last_id = max(latest[0].id - 5, 0)
         state[key] = last_id
+        
     messages = await client.get_messages(entity_ref, min_id=last_id, limit=200)
     if not messages: return
     messages = list(reversed(messages))
     processed_ids = set()
+    
     for msg in messages:
         if msg.id in processed_ids: continue
         if msg.grouped_id:
