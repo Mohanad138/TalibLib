@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os, re, json, time, asyncio, subprocess, difflib
+from datetime import datetime
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import (MessageEntityTextUrl, MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage)
@@ -20,12 +21,15 @@ CHANNELS = {
         "name": "مكتبة الطالب العراقي", "target": -1001743729724,
         "source_username": "@eduiq23",
         "add_link": True, "link": "https://t.me/TalibLib",
-        "prompt": """أنت محرر لقناة تعليمية (مكتبة الطالب). 
-- انشر فقط الأخبار الرسمية أو المعلومات المجانية المفيدة التي تخص الطلبة، الجامعات، وزارة التربية، أو المنح الدراسية (اجعل should_post=true).
+        "prompt": """أنت محرر صارم لقناة تعليمية (مكتبة الطالب). 
+- انشر فقط الأخبار الرسمية الموثوقة أو المعلومات المجانية المفيدة التي تخص الطلبة، الجامعات، وزارة التربية، أو المنح الدراسية (اجعل should_post=true).
 - **ممنوع النشر (اجعل should_post=false) إذا كان المنشور يحتوي على:**
   1. بيع أو ترويج لملخصات، كتب، أو دورات (حتى لو كانت تعليمية).
   2. طلب من الطالب مراسلة معرف معين للتواصل أو الحجز (مثل: راسل المعرف، تواصل معنا، @IQED3).
   3. أي أسعار، خصومات، أو إعلانات تجارية.
+  4. **أخبار كاذبة، شائعات، أو منشورات "Clickbait" (مثل: رابط الامتحانات، أبطال 2027، تسريبات).**
+  5. **أي منشور يذكر سنة مستقبلية بعيدة (مثل 2027 أو 2028) مرتبط بالامتحانات أو النتائج وكأنها تحدث الآن، ارفضه فوراً لأنه شائعة.**
+  6. المنشورات التي لا تحتوي على نص حقيقي وتكون مجرد رابط (Link) مع جملة تشويقية.
 - أعد صياغة النص بشكل واضح ومختصر.
 - لا تذكر اسم قناة المصدر أو روابطها نهائياً."""
     },
@@ -147,7 +151,7 @@ def insert_link_after_share_phrase(text, link_text):
 
 def contains_click_here_phrase(text): return bool(re.search(r'اضغط\s*هنا.{0,15}(للمشاهدة|لمشاهدة|مشاهدة)', text)) if text else False
 
-# === فلتر برمجي صارم للإعلانات ===
+# === فلتر برمجي صارم للإعلانات (الأصلي) ===
 def is_hardcoded_ad(text):
     if not text: return False
     ad_keywords = [
@@ -157,6 +161,30 @@ def is_hardcoded_ad(text):
     for kw in ad_keywords:
         if re.search(kw, text, re.IGNORECASE):
             return True
+    return False
+
+# === فلتر برمجي جديد للشائعات والمنشورات الكاذبة ===
+def is_fake_news_or_clickbait(text):
+    if not text: return False
+    
+    clickbait_patterns = [
+        r"أبطال\s+202[5-9]",
+        r"رابط\s+الامتحانات",
+        r"تسريب",
+        r"الامتحان\s+النهائي\s+سيعقد",
+        r"اكتمل\s+الفصل",
+        r"تنبيه\s+هام\s+جداً",
+        r"عاجل\s+جداً"
+    ]
+    
+    for pattern in clickbait_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+            
+    clean_t = re.sub(r'https?://\S+', '', text).strip()
+    if len(clean_t.split()) < 10 and "t.me" in text:
+        return True
+        
     return False
 
 def call_groq(prompt, max_retries=3):
@@ -180,7 +208,12 @@ async def apply_processing(config, text):
     custom_prompt = config.get("prompt", "")
     if not custom_prompt: return {"should_post": True, "text": text}
     
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    
     full_prompt = f"""{custom_prompt}
+
+ملاحظة هامة جداً: التاريخ الحالي اليوم هو {current_date}. 
+إذا كان المنشور يتحدث عن امتحانات أو نتائج لسنوات مستقبلية بعيدة (مثل 2027) وكأنها تحدث الآن، فهو منشور كاذب (Fake News) ويجب رفضه (should_post: false).
 
 النص المراد معالجته:
 {text}
@@ -206,9 +239,14 @@ async def process_batch(source_id, messages):
     
     if contains_click_here_phrase(raw_text): return
     
-    # التحقق من الفلتر البرمجي للإعلانات
+    # 1. التحقق من الفلتر البرمجي للإعلانات
     if is_hardcoded_ad(raw_text):
         print(f"⏭️ تجاهل إعلان تجاري (فلتر برمجي) — {config['name']}")
+        return
+        
+    # 2. التحقق من فلتر الشائعات والمنشورات الكاذبة (المضاف الجديد)
+    if is_fake_news_or_clickbait(raw_text):
+        print(f"⏭️ تجاهل شائعة أو منشور ترند كاذب (فلتر برمجي) — {config['name']}")
         return
     
     hidden_links = extract_hidden_link_urls(text_msg, config.get("source_username"))
