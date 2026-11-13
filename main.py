@@ -3,7 +3,7 @@ import os, re, json, time, asyncio, subprocess, difflib
 from datetime import datetime
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import (MessageEntityTextUrl, MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage)
+from telethon.tl.types import (MessageEntityTextUrl, MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage, PeerChannel)
 import requests
 
 TG_API_ID = int(os.getenv("TG_API_ID"))
@@ -21,15 +21,17 @@ CHANNELS = {
         "name": "مكتبة الطالب العراقي", "target": -1001743729724,
         "source_username": "@eduiq23",
         "add_link": True, "link": "https://t.me/TalibLib",
-        "prompt": """أنت محرر صارم لقناة تعليمية (مكتبة الطالب). 
-- انشر فقط الأخبار الرسمية الموثوقة أو المعلومات المجانية المفيدة التي تخص الطلبة، الجامعات، وزارة التربية، أو المنح الدراسية (اجعل should_post=true).
+        "prompt": """أنت محرر صارم جداً لقناة تعليمية (مكتبة الطالب). قناة المصدر تحتوي على أخبار رسمية ولكنها أيضاً تحتوي على دردشة طلابية وشكاوى.
+- انشر فقط الأخبار الرسمية الموثوقة، القرارات الوزارية، أو المعلومات المجانية المفيدة التي تخص الطلبة، الجامعات، وزارة التربية، أو المنح الدراسية (اجعل should_post=true).
 - **ممنوع النشر (اجعل should_post=false) إذا كان المنشور يحتوي على:**
-  1. بيع أو ترويج لملخصات، كتب، أو دورات (حتى لو كانت تعليمية).
-  2. طلب من الطالب مراسلة معرف معين للتواصل أو الحجز (مثل: راسل المعرف، تواصل معنا، @IQED3).
+  1. بيع أو ترويج لملخصات، كتب، أو دورات.
+  2. طلب من الطالب مراسلة معرف معين للتواصل أو الحجز.
   3. أي أسعار، خصومات، أو إعلانات تجارية.
-  4. **أخبار كاذبة، شائعات، أو منشورات "Clickbait" (مثل: رابط الامتحانات، أبطال 2027، تسريبات).**
-  5. **أي منشور يذكر سنة مستقبلية بعيدة (مثل 2027 أو 2028) مرتبط بالامتحانات أو النتائج وكأنها تحدث الآن، ارفضه فوراً لأنه شائعة.**
-  6. المنشورات التي لا تحتوي على نص حقيقي وتكون مجرد رابط (Link) مع جملة تشويقية.
+  4. **أخبار كاذبة، شائعات، أو منشورات "Clickbait" (مثل: أبطال 2027، تسريبات).**
+  5. **أسئلة الطلبة الشخصية، الاستفسارات، طلب النصائح (مثل: أستاذ أحتاج نصائح، أنا خائفة).**
+  6. **شكاوى الطلبة أو رسائلهم الموجهة للوزارة (مثل: أود إبلاغ وزارة التربية، نطلب إلغاء قرار).**
+  7. **محادثات جانبية لا علاقة لها بالأخبار (مثل: استلم فلوس التبرعات، بلغو باقي بنات).**
+  8. أي منشور يذكر سنة مستقبلية بعيدة (مثل 2027) وكأنها تحدث الآن.
 - أعد صياغة النص بشكل واضح ومختصر.
 - لا تذكر اسم قناة المصدر أو روابطها نهائياً."""
     },
@@ -166,32 +168,53 @@ def is_hardcoded_ad(text):
 # === فلتر برمجي جديد للشائعات والمنشورات الكاذبة ===
 def is_fake_news_or_clickbait(text):
     if not text: return False
-    
     clickbait_patterns = [
-        r"أبطال\s+202[5-9]",
-        r"رابط\s+الامتحانات",
-        r"تسريب",
-        r"الامتحان\s+النهائي\s+سيعقد",
-        r"اكتمل\s+الفصل",
-        r"تنبيه\s+هام\s+جداً",
-        r"عاجل\s+جداً"
+        r"أبطال\s+202[5-9]", r"رابط\s+الامتحانات", r"تسريب",
+        r"الامتحان\s+النهائي\s+سيعقد", r"اكتمل\s+الفصل",
+        r"تنبيه\s+هام\s+جداً", r"عاجل\s+جداً"
+    ]
+    for pattern in clickbait_patterns:
+        if re.search(pattern, text, re.IGNORECASE): return True
+    clean_t = re.sub(r'https?://\S+', '', text).strip()
+    if len(clean_t.split()) < 10 and "t.me" in text: return True
+    return False
+
+# === فلتر برمجي جديد (للدردشة، الأسئلة، والشكاوى، والمنشورات المحولة) ===
+def is_student_chatter_or_forwarded(message, text):
+    if not text: return False
+    
+    # 1. منع الرسائل المحولة (Forwarded) من مستخدمين (ليس من قنوات رسمية)
+    # الرسائل المحولة من قنوات الأخبار الرسمية قد تكون مفيدة، لكن المحولة من أشخاص عاديين هي دردشة
+    if getattr(message, 'fwd_from', None) is not None:
+        # إذا كانت محولة من مستخدم (شخص) وليس من قناة
+        if not isinstance(getattr(message.fwd_from, 'from_id', None), PeerChannel):
+            return True
+            
+    # 2. منع الأسئلة الشخصية، الشكاوى، والدردشة
+    chatter_patterns = [
+        r"أستاذ\s+[^\s]+",       # أستاذ حجاب
+        r"أحتاج\s+نصائح",        # أحتاج نصائح
+        r"أنا\s+خائفة",          # وأنا خائفة
+        r"أود\s+إبلاغ",          # أود إبلاغ وزارة
+        r"نطلب\s+إلغاء",         # نطلب إلغاء
+        r"فلوس\s+التبرعات",      # فلوس التبرعات
+        r"بلغو\s+باقي\s+بنات",   # بلغو باقي بنات
+        r"السلام\s+عليكم\s+أستاذ", # السلام عليكم أستاذ
+        r"سؤال\s+لو\s+تكرمت",     # سؤال لو تكرمت
+        r"استفسار"               # استفسار
     ]
     
-    for pattern in clickbait_patterns:
+    for pattern in chatter_patterns:
         if re.search(pattern, text, re.IGNORECASE):
             return True
             
-    clean_t = re.sub(r'https?://\S+', '', text).strip()
-    if len(clean_t.split()) < 10 and "t.me" in text:
-        return True
-        
     return False
 
 def call_groq(prompt, max_retries=3):
     if not GROQ_API_KEY: raise RuntimeError("no groq key")
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    body = {"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3}
+    body = {"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1} # خفضت الحرارة ليكون دقيقاً
     for attempt in range(1, max_retries + 1):
         try:
             resp = requests.post(url, json=body, headers=headers, timeout=30)
@@ -213,7 +236,7 @@ async def apply_processing(config, text):
     full_prompt = f"""{custom_prompt}
 
 ملاحظة هامة جداً: التاريخ الحالي اليوم هو {current_date}. 
-إذا كان المنشور يتحدث عن امتحانات أو نتائج لسنوات مستقبلية بعيدة (مثل 2027) وكأنها تحدث الآن، فهو منشور كاذب (Fake News) ويجب رفضه (should_post: false).
+قناة المصدر تحتوي على الكثير من الدردشة والأسئلة، أنت وظيفتك استخراج الأخبار الرسمية فقط. إذا كان المنشور مجرد سؤال، شكوى، دردشة، أو كلام غير رسمي، ارفضه فوراً (should_post: false).
 
 النص المراد معالجته:
 {text}
@@ -234,8 +257,11 @@ async def process_batch(source_id, messages):
     config = CHANNELS.get(source_id)
     if not config: return
     
+    # نأخذ الرسالة الأساسية للتحقق
+    main_msg = messages[0] if messages else None
+    if not main_msg: return
+
     raw_text = next((m.message for m in messages if m.message), "")
-    text_msg = next((m for m in messages if m.message), None)
     
     if contains_click_here_phrase(raw_text): return
     
@@ -244,12 +270,17 @@ async def process_batch(source_id, messages):
         print(f"⏭️ تجاهل إعلان تجاري (فلتر برمجي) — {config['name']}")
         return
         
-    # 2. التحقق من فلتر الشائعات والمنشورات الكاذبة (المضاف الجديد)
+    # 2. التحقق من فلتر الشائعات
     if is_fake_news_or_clickbait(raw_text):
-        print(f"⏭️ تجاهل شائعة أو منشور ترند كاذب (فلتر برمجي) — {config['name']}")
+        print(f"⏭️ تجاهل شائعة أو منشور كاذب (فلتر برمجي) — {config['name']}")
+        return
+
+    # 3. التحقق من فلتر الدردشة، الأسئلة، والمنشورات المحولة (الجديد)
+    if is_student_chatter_or_forwarded(main_msg, raw_text):
+        print(f"⏭️ تجاهل دردشة، سؤال، شكوى أو منشور محول (فلتر برمجي) — {config['name']}")
         return
     
-    hidden_links = extract_hidden_link_urls(text_msg, config.get("source_username"))
+    hidden_links = extract_hidden_link_urls(main_msg, config.get("source_username"))
     if hidden_links: 
         raw_text = (raw_text.rstrip() + "\n\n" + "\n".join(hidden_links)) if raw_text else "\n".join(hidden_links)
     
@@ -262,7 +293,7 @@ async def process_batch(source_id, messages):
     final_text = res.get("text", cleaned)
     
     if not should_post and cleaned: 
-        print(f"⏭️ تجاهل إعلان (ذكاء اصطناعي) — {config['name']}")
+        print(f"⏭️ تجاهل كلام غير مفيد (ذكاء اصطناعي) — {config['name']}")
         return 
     
     if cleaned: record_published_text(source_id, cleaned)
